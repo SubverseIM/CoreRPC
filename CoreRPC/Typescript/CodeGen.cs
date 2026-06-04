@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using System.Threading.Tasks;
 
@@ -15,7 +16,22 @@ namespace CoreRPC.Typescript
             var ctor = new List<string>();
             var fields = new List<string>();
             var interfaceFields = new List<string>();
-            
+
+            // Human-readable description of an RPC call, handed to the (optional) custom fetch
+            // callback so that calls can be told apart for logging/diagnostics.
+            code.BeginInterface("CoreRpcCallInfo");
+            code.AppendLines(
+                "rpc : string;",
+                "method : string;",
+                "args : {[name: string] : any};"
+            );
+            code.End();
+            // The init passed to fetch is a plain RequestInit with an extra `coreRpc` field, so it
+            // stays assignable to window.fetch's parameter while carrying the call metadata.
+            code.AppendLine("export type CoreRpcRequestInit = RequestInit & { coreRpc: CoreRpcCallInfo };");
+            code.BeginInterface("CoreApiOptions");
+            code.AppendLine("appendCallNamesToQuery? : boolean;");
+            code.End();
 
             foreach (var type in types)
             {
@@ -65,7 +81,10 @@ namespace CoreRPC.Typescript
                             code.BeginBody();
                             var req =
                                 $"{{Target: '{target}', MethodSignature: '{sig}', Arguments: [{string.Join(",", names)}] }}";
-                            code.AppendLine($"return this.parent.send<{returnTypeName}>({req});");
+                            var argMap = string.Join(", ", names.Select(n => $"\"{n}\": {n}"));
+                            var info =
+                                $"{{rpc: '{target}', method: '{m.Name}', args: {{{argMap}}} }}";
+                            code.AppendLine($"return this.parent.send<{returnTypeName}>({req}, {info});");
                             code.End();
                         }
                     }
@@ -89,19 +108,26 @@ namespace CoreRPC.Typescript
             code.BeginClass(opts.ClassName + " implements I" + opts.ClassName);
             code.AppendLines(
                 "private baseUrl: string;",
-                "private fetch: (url: string, init: RequestInit) => Promise<Response>;",
+                "private fetch: (url: string, init: CoreRpcRequestInit) => Promise<Response>;",
+                "public appendCallNamesToQuery: boolean;",
 
-                "constructor(baseUrl : string, customFetch?: (url: string, init: RequestInit) => Promise<Response>) {",
+                "constructor(baseUrl : string, customFetch?: (url: string, init: CoreRpcRequestInit) => Promise<Response>, options?: CoreApiOptions) {",
                 "this.baseUrl = baseUrl;",
-                "if(customFetch) this.fetch = customFetch; else this.fetch =  (r, i) => fetch(r, i);"
+                "if(customFetch) this.fetch = customFetch; else this.fetch =  (r, i) => fetch(r, i);",
+                "this.appendCallNamesToQuery = !!(options && options.appendCallNamesToQuery);"
             );
             code.AppendLines(ctor.ToArray());
             code.AppendLine("}");
 
 
             code.AppendLines(
-                "public send<T>(request: any) : Promise<T>{",
-                "return this.fetch(this.baseUrl, {method: 'post', body: JSON.stringify(request)})",
+                "public send<T>(request: any, coreRpc: CoreRpcCallInfo) : Promise<T>{",
+                "let url = this.baseUrl;",
+                "if (this.appendCallNamesToQuery) {",
+                "    const sep = url.indexOf('?') < 0 ? '?' : '&';",
+                "    url = url + sep + 'rpc=' + encodeURIComponent(coreRpc.rpc) + '&method=' + encodeURIComponent(coreRpc.method);",
+                "}",
+                "return this.fetch(url, {method: 'post', body: JSON.stringify(request), coreRpc: coreRpc})",
                 "    .then(response => {",
                 "        if (!response.ok)",
                 "            throw new Error(response.statusText);",
